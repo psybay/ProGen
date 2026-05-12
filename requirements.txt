@@ -5,3 +5,6 @@ uvicorn
 pydantic
 numpy
 shapely
+pytest
+networkx
+scipy

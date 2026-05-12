@@ -1,18 +1,14 @@
-import geopandas as gpd
-
 import uuid
-from shapely.geometry import shape, Point, MultiPolygon
-from app.schemas import GenerationRequest
+from typing import Dict, List, Tuple
 
-
-
-import numpy as np
+import geopandas as gpd
 import networkx as nx
-from shapely.geometry import Point, LineString
-from typing import Dict, Tuple
+import numpy as np
+from scipy.spatial import Delaunay
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, shape
+from shapely.ops import polygonize, unary_union
 
-# Assuming schemas.py is in the same directory
-from .schemas import GenerationRequest
+from .schemas import GenerationRequest, GenerationResponse, GeoJSONFeature, GeoJSONGeometry, GeoJSONFeatureCollection
 
 def _edges_intersect(p1: np.ndarray, p2: np.ndarray, G: nx.Graph) -> bool:
     """
@@ -72,8 +68,10 @@ def _attempt_cross_link(G: nx.Graph, new_node_id: int, request: GenerationReques
             continue
 
         # 3. Add the Secondary Bond
-        weight = request.arterial_length if (G.nodes[new_node_id]['type'] == 'major' and G.nodes[target_node]['type'] == 'major') else request.local_length
-        G.add_edge(new_node_id, target_node, weight=weight)
+        is_major = (G.nodes[new_node_id]['type'] == 'major' and G.nodes[target_node]['type'] == 'major')
+        weight = request.arterial_length if is_major else request.local_length
+        
+        G.add_edge(new_node_id, target_node, weight=weight, is_arterial=is_major)
         
         # Only form one cross-link per spawn to keep it organic
         break
@@ -111,7 +109,8 @@ def generate_base_graph(request: GenerationRequest) -> nx.Graph:
         
         # Add the Node & Primary Bond
         G.add_node(i, pos=new_pos, type=node_type, age=0)
-        G.add_edge(parent, i, weight=spawn_dist)
+        is_major = (G.nodes[parent]['type'] == 'major' and node_type == 'major')
+        G.add_edge(parent, i, weight=spawn_dist, is_arterial=is_major)
         
         # Attempt Phase 2: Topological Weaving (Secondary Bonds)
         _attempt_cross_link(G, i, request)
@@ -148,65 +147,245 @@ def generate_base_graph(request: GenerationRequest) -> nx.Graph:
 
     return G
 
-def generate_district(request: GenerationRequest) -> gpd.GeoDataFrame:
-    """
-    Vectorized district generator using GeoPandas and NumPy.
-    No classes used, strictly functional approach.
-    """
-    
-    # 1. Parse site_polygon into Shapely geometry
-    site_geom = shape(request.site_polygon)
-    
-    # 2. Use NumPy to generate random (x, y) coordinate arrays within bounding box
-    minx, miny, maxx, maxy = site_geom.bounds
-    # Oversample to ensure we get enough points after site boundary filtering
-    sample_size = request.num_buildings * 5 
-    x_arr = np.random.uniform(minx, maxx, sample_size)
-    y_arr = np.random.uniform(miny, maxy, sample_size)
-    
-    # 3. Convert valid points (inside site) into a GeoSeries
-    pts_gs = gpd.GeoSeries(gpd.points_from_xy(x_arr, y_arr))
-    valid_pts = pts_gs[pts_gs.within(site_geom)].iloc[:request.num_buildings]
-    
-    if valid_pts.empty:
-        return gpd.GeoDataFrame(columns=['geometry', 'b_ID', 'height'])
 
-    # 4. Vectorized Growth: Expand points into initial buffers
-    # Estimate radius based on target density: Area = density * total_area
-    # Area_per_building = (density * total_area) / num_buildings
-    # pi * r^2 = target_area => r = sqrt(target_area / pi)
-    site_area = site_geom.area
-    target_total_building_area = site_area * request.target_density
-    radius = np.sqrt((target_total_building_area / len(valid_pts)) / np.pi)
+def planarize_graph(G: nx.Graph) -> nx.Graph:
+    """
+    Phase 3: Mesh Healing (Planarization).
+    Breaks intersecting edges while inheriting the 'age' and 'is_arterial' states.
+    """
+    lines = []
+    # Store a mapping of LineStrings back to their original edge data to preserve is_arterial
+    line_to_data = {}
     
-    # Apply buffer (vectorized)
-    buildings_gs = valid_pts.buffer(radius)
-    
-    # 5. Merge Overlaps: Dissolve overlapping buffers
-    dissolved_union = buildings_gs.unary_union
-    
-    # 6. Explode: Break back down into individual polygons
-    if isinstance(dissolved_union, MultiPolygon):
-        exploded_gs = gpd.GeoSeries([dissolved_union]).explode(index_parts=False)
-    else:
-        exploded_gs = gpd.GeoSeries([dissolved_union])
+    for u, v, data in G.edges(data=True):
+        p1 = G.nodes[u]['pos']
+        p2 = G.nodes[v]['pos']
+        line = LineString([p1, p2])
+        lines.append(line)
+        line_to_data[line.wkt] = data.get('is_arterial', False)
         
-    gdf = gpd.GeoDataFrame(geometry=exploded_gs)
+    merged = unary_union(lines)
     
-    # 7. Boundaries: Ensure no building exceeds site_polygon
-    gdf.geometry = gdf.geometry.intersection(site_geom)
-    # Clean up empty or invalid results from intersection
-    gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.type.isin(['Polygon', 'MultiPolygon'])]
+    segments = []
+    if merged.geom_type == 'MultiLineString':
+        segments = list(merged.geoms)
+    elif merged.geom_type == 'LineString':
+        segments = [merged]
+    elif merged.geom_type == 'GeometryCollection':
+        segments = [geom for geom in merged.geoms if geom.geom_type == 'LineString']
+        
+    G_planar = nx.Graph()
+    coord_to_id = {}
+    next_id = 0
     
-    # 8. Subtract Obstacles
-    if request.obstacles and 'features' in request.obstacles:
-        obstacles_gdf = gpd.GeoDataFrame.from_features(request.obstacles)
-        if not obstacles_gdf.empty:
-            # Set CRS to avoid warnings if applicable (using a dummy one here)
-            gdf = gpd.overlay(gdf, obstacles_gdf, how='difference')
+    # Pre-map the original nodes so we can inherit their age/type
+    original_coords = { (round(data['pos'][0], 4), round(data['pos'][1], 4)): data for n, data in G.nodes(data=True) }
     
-    # 9. Add Metadata
-    gdf['b_ID'] = [str(uuid.uuid4()) for _ in range(len(gdf))]
-    gdf['height'] = np.random.uniform(10.0, 50.0, len(gdf))
+    def get_or_create_node(coord):
+        nonlocal next_id
+        coord_tup = (round(coord[0], 4), round(coord[1], 4))
+        
+        if coord_tup not in coord_to_id:
+            coord_to_id[coord_tup] = next_id
+            
+            # INHERITANCE: If this coordinate matches an original node, keep its age/type!
+            if coord_tup in original_coords:
+                orig_data = original_coords[coord_tup]
+                G_planar.add_node(next_id, pos=np.array(coord), type=orig_data['type'], age=orig_data['age'])
+            else:
+                # It's a newly sliced intersection node. It is young and minor.
+                G_planar.add_node(next_id, pos=np.array(coord), type='minor', age=0)
+            next_id += 1
+            
+        return coord_to_id[coord_tup]
+
+    for line in segments:
+        coords = list(line.coords)
+        
+        # INHERITANCE: Figure out if this broken segment was originally an arterial
+        # (A simple midpoint check against the original lines)
+        midpoint = line.interpolate(0.5, normalized=True)
+        is_art = False
+        for orig_line_wkt, was_arterial in line_to_data.items():
+            import shapely.wkt
+            orig_line = shapely.wkt.loads(orig_line_wkt)
+            if orig_line.distance(midpoint) < 1e-6:
+                is_art = was_arterial
+                break
+
+        for i in range(len(coords) - 1):
+            u_id = get_or_create_node(coords[i])
+            v_id = get_or_create_node(coords[i+1])
+            
+            dist = np.linalg.norm(G_planar.nodes[u_id]['pos'] - G_planar.nodes[v_id]['pos'])
+            G_planar.add_edge(u_id, v_id, weight=dist, is_arterial=is_art)
+            
+    return G_planar
+
+
+def resolve_voids_and_zone(G: nx.Graph, request: GenerationRequest) -> Tuple[nx.Graph, List[Polygon]]:
+    """
+    Phase 4: Zoning & Void Resolution.
+    Finds >5 edge blocks and converts them to parks or subdivides via Delaunay.
+    """
+    # 1. Convert edges back to lines to find faces
+    lines = [LineString([G.nodes[u]['pos'], G.nodes[v]['pos']]) for u, v in G.edges]
+        
+    # 2. Polygonize to find all enclosed blocks
+    faces = list(polygonize(lines))
     
-    return gdf
+    parks = []
+    
+    # Helper to map coordinates back to graph nodes for Delaunay edge insertion
+    coord_to_id = { (round(data['pos'][0], 4), round(data['pos'][1], 4)): n for n, data in G.nodes(data=True) }
+    
+    for face in faces:
+        coords = list(face.exterior.coords)
+        # A 3-edge triangle has 4 coordinates (the start and end overlap).
+        # Therefore, >6 coordinates means the face has >5 edges (A Void!)
+        if len(coords) > 6:
+            make_park = False
+            if request.void_resolution_strategy == 'parks':
+                make_park = True
+            elif request.void_resolution_strategy == 'mixed':
+                make_park = np.random.rand() < request.park_ratio
+                
+            if make_park:
+                # Save as a Green Space
+                parks.append(face)
+            else:
+                # Delaunay Subdivision
+                unique_coords = coords[:-1] # Remove overlapping end coordinate
+                pts = np.array(unique_coords)
+                
+                # Safety check: Delaunay needs at least 3 points
+                if len(pts) >= 3:
+                    tri = Delaunay(pts)
+                    for simplex in tri.simplices:
+                        # simplex contains 3 indices pointing to pts array
+                        for i in range(3):
+                            p1 = pts[simplex[i]]
+                            p2 = pts[simplex[(i+1)%3]]
+                            
+                            id1 = coord_to_id[(round(p1[0], 4), round(p1[1], 4))]
+                            id2 = coord_to_id[(round(p2[0], 4), round(p2[1], 4))]
+                            
+                            # Add the new internal street connecting the perimeter nodes
+                            if not G.has_edge(id1, id2):
+                                dist = np.linalg.norm(p1 - p2)
+                                G.add_edge(id1, id2, weight=dist)
+                                
+    return G, parks
+
+
+def finalize_city(G: nx.Graph, parks: List[Polygon], request: GenerationRequest) -> GenerationResponse:
+    """
+    Phase 5: Final Annealing & Translation.
+    Relaxes the final graph, buffers the streets, cuts the blocks, and formats the API response.
+    """
+    # ---------------------------------------------------------
+    # 1. Final Physics Annealing
+    # ---------------------------------------------------------
+    # Identify which nodes were historically frozen
+    frozen_nodes = [n for n in G.nodes if G.nodes[n]['age'] >= request.freezing_age_threshold]
+    
+    # Run a quick relaxation to smooth out the new Delaunay void-streets
+    new_positions = nx.spring_layout(
+        G, 
+        pos=nx.get_node_attributes(G, 'pos'), 
+        fixed=frozen_nodes if frozen_nodes else None,
+        k=request.local_length, 
+        weight='weight',
+        iterations=5, # Just enough to smooth the jagged edges
+        seed=42
+    )
+    nx.set_node_attributes(G, new_positions, 'pos')
+
+    # ---------------------------------------------------------
+    # 2. Street Buffering (Geometry Translation)
+    # ---------------------------------------------------------
+    street_polygons = []
+    for u, v, data in G.edges(data=True):
+        p1 = G.nodes[u]['pos']
+        p2 = G.nodes[v]['pos']
+        line = LineString([p1, p2])
+        
+        # Determine physical street width
+        is_arterial = data.get('is_arterial', False)
+        width = request.arterial_width if is_arterial else request.local_width
+        
+        # Buffer the line (cap_style=2 is flat, join_style=2 is mitre)
+        street_polygons.append(line.buffer(width / 2.0, cap_style=2, join_style=2))
+        
+    # Combine all individual street buffers into one giant asphalt polygon
+    master_street_network = unary_union(street_polygons)
+
+    # ---------------------------------------------------------
+    # 3. Block Generation (Boolean Subtraction)
+    # ---------------------------------------------------------
+    # Parse the input GeoJSON site boundary
+    # FIX: Convert the Pydantic model to a raw dictionary so Shapely can read it
+    geom_dict = request.site_polygon.geometry.model_dump() 
+    # Note: if you are using an older version of Pydantic (v1), use .dict() instead of .model_dump()
+    
+    site_boundary = shape(geom_dict)
+    
+    # Subtract the streets from the site to get the raw urban blocks
+    raw_blocks = site_boundary.difference(master_street_network)
+    
+    # Explode MultiPolygons into individual block Polygons
+    if raw_blocks.geom_type == 'MultiPolygon':
+        individual_blocks = list(raw_blocks.geoms)
+    elif raw_blocks.geom_type == 'Polygon':
+        individual_blocks = [raw_blocks]
+    else:
+        individual_blocks = []
+
+    # ---------------------------------------------------------
+    # 4. Filter Parks & Format API Response
+    # ---------------------------------------------------------
+    from shapely.geometry import mapping  # Import the native GeoJSON mapper
+    
+    block_features = []
+    park_union = unary_union(parks) if parks else Polygon()
+    
+    for i, block in enumerate(individual_blocks):
+        # Skip tiny slivers created by mathematical rounding
+        if block.area < 10.0: continue
+            
+        is_park = False
+        if not park_union.is_empty and block.intersection(park_union).area > (block.area * 0.5):
+            is_park = True
+            
+        # FIX: Use native mapping to guarantee perfect GeoJSON translation
+        geom_mapped = mapping(block)
+        
+        block_features.append(GeoJSONFeature(
+            geometry=GeoJSONGeometry(type=geom_mapped["type"], coordinates=geom_mapped["coordinates"]),
+            properties={
+                "block_id": f"blk_{i}",
+                "landuse": "park" if is_park else "development",
+                "area": round(block.area, 2)
+            }
+        ))
+
+    # Format the Street Network for export
+    street_features = []
+    
+    # FIX: Map the entire master network at once. 
+    # This automatically handles Polygons, MultiPolygons, and all nested holes flawlessly.
+    street_mapped = mapping(master_street_network)
+    street_features.append(GeoJSONFeature(
+        geometry=GeoJSONGeometry(type=street_mapped["type"], coordinates=street_mapped["coordinates"]),
+        properties={"type": "asphalt"}
+    ))
+
+    return GenerationResponse(
+        blocks=GeoJSONFeatureCollection(features=block_features),
+        streets=GeoJSONFeatureCollection(features=street_features),
+        metadata={
+            "total_nodes": len(G.nodes),
+            "total_blocks": len(block_features),
+            "parks_generated": len(parks)
+        }
+    )
