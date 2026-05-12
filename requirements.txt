@@ -1,0 +1,7 @@
+# ProGen requirements
+geopandas
+fastapi
+uvicorn
+pydantic
+numpy
+shapely
