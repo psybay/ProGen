@@ -1,9 +1,18 @@
 import json
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from .schemas import GenerationRequest, GenerationResponse
 from .engine import generate_base_graph, planarize_graph, resolve_voids_and_zone, finalize_city
 
 app = FastAPI(title="Urban Morphology Microservice")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows any local HTML file to fetch data
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.post("/generate-district", response_model=GenerationResponse)
 async def generate_district_endpoint(request: GenerationRequest):

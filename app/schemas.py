@@ -66,10 +66,22 @@ class GenerationRequest(BaseModel):
         le=1.0, 
         description="Chance to weave branches together into 3-5 edge urban blocks."
     )
-    freezing_age_threshold: int = Field(
-        20, 
-        ge=1, 
-        description="How many simulation ticks before a hot node locks its coordinates (Historical Freezing)."
+    centrality: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="0.0 = Sprawling branches (Depth-First), 1.0 = Dense centralized city core (Breadth-First)."
+    )
+    min_intersect_angle: float = Field(
+        30.0,
+        ge=15.0,
+        le=90.0,
+        description="Minimum angle (in degrees) between connected streets to prevent sharp blocks."
+    )
+    settle_threshold: float = Field(
+        0.5,
+        gt=0.0,
+        description="Minimum displacement (meters) per tick below which a node is considered settled and frozen."
     )
 
     # 3. Void Resolution Parameters (Phase 4)

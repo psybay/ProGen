@@ -22,6 +22,37 @@ def _edges_intersect(p1: np.ndarray, p2: np.ndarray, G: nx.Graph) -> bool:
             return True
     return False
 
+def _check_angle_validity(G: nx.Graph, node_id: int, new_pos: np.ndarray, min_angle_rad: float) -> bool:
+    """
+    Checks if the angle between the new edge and any existing edge connected to node_id
+    is strictly greater than or equal to min_angle_rad.
+    """
+    if node_id not in G or G.degree[node_id] == 0:
+        return True
+        
+    pos_node = G.nodes[node_id]['pos']
+    v_new = new_pos - pos_node
+    norm_new = np.linalg.norm(v_new)
+    if norm_new < 1e-6:
+        return False
+    v_new = v_new / norm_new
+    
+    for neighbor in G.neighbors(node_id):
+        pos_neighbor = G.nodes[neighbor]['pos']
+        v_existing = pos_neighbor - pos_node
+        norm_existing = np.linalg.norm(v_existing)
+        if norm_existing < 1e-6:
+            continue
+        v_existing = v_existing / norm_existing
+        
+        dot_prod = np.clip(np.dot(v_new, v_existing), -1.0, 1.0)
+        angle = np.arccos(dot_prod)
+        
+        if angle < min_angle_rad:
+            return False
+            
+    return True
+
 def _attempt_cross_link(G: nx.Graph, new_node_id: int, request: GenerationRequest):
     """
     Phase 2: Topological Weaving. Attempts to form 3, 4, or 5 edge loops.
@@ -67,6 +98,13 @@ def _attempt_cross_link(G: nx.Graph, new_node_id: int, request: GenerationReques
         if _edges_intersect(new_pos, G.nodes[target_node]['pos'], G):
             continue
 
+        # Angle Check
+        min_angle_rad = np.radians(request.min_intersect_angle)
+        if not _check_angle_validity(G, new_node_id, G.nodes[target_node]['pos'], min_angle_rad):
+            continue
+        if not _check_angle_validity(G, target_node, new_pos, min_angle_rad):
+            continue
+
         # 3. Add the Secondary Bond
         is_major = (G.nodes[new_node_id]['type'] == 'major' and G.nodes[target_node]['type'] == 'major')
         weight = request.arterial_length if is_major else request.local_length
@@ -83,67 +121,94 @@ def generate_base_graph(request: GenerationRequest) -> nx.Graph:
     """
     G = nx.Graph()
     
-    # Spawn Seed Node (The Ancient City Center)
-    G.add_node(0, pos=np.array([0.0, 0.0]), type='major', age=0)
+    # 1. Parse Site and find Center
+    geom_dict = request.site_polygon.geometry.model_dump() 
+    site_poly = shape(geom_dict)
+    center = np.array([site_poly.centroid.x, site_poly.centroid.y])
+    
+    # 2. Spawn Seed Node AT THE EXACT CENTER
+    G.add_node(0, pos=center, type='major', frozen=False, quiet_ticks=0)
     
     for i in range(1, request.target_node_count):
-        # Determine Node Type
         node_type = 'major' if np.random.rand() < request.major_node_ratio else 'minor'
         
-        # Find valid parents (nodes with open valency)
         valid_parents = [n for n in G.nodes if G.degree[n] < request.max_valency]
-        
-        # If the city is totally maxed out (rare), stop growing
         if not valid_parents: break
             
-        # Pick a parent (bias towards newer nodes to encourage outward sprawl)
-        parent = valid_parents[-1] if np.random.rand() > 0.3 else np.random.choice(valid_parents)
+        if np.random.rand() < request.centrality:
+            distances = [(np.linalg.norm(G.nodes[n]['pos'] - center), n) for n in valid_parents]
+            distances.sort(key=lambda x: x[0])
+            top_k = max(1, int(len(valid_parents) * 0.15))
+            top_nodes = [n for _, n in distances[:top_k]]
+            parent = np.random.choice(top_nodes)
+        else:
+            if np.random.rand() < 0.8:
+                parent = max(valid_parents)
+            else:
+                parent = np.random.choice(valid_parents)
         parent_pos = G.nodes[parent]['pos']
         
-        # Calculate spawn distance based on Hooke's Law resting lengths
         spawn_dist = request.arterial_length if (node_type == 'major' and G.nodes[parent]['type'] == 'major') else request.local_length
         
-        # Spawn at a random angle around the parent
         angle = np.random.uniform(0, 2 * np.pi)
         new_pos = parent_pos + np.array([np.cos(angle), np.sin(angle)]) * spawn_dist
+        # Add tiny jitter to prevent nodes stacking between physics ticks
+        new_pos += np.random.uniform(-1.0, 1.0, size=2)
         
+        # 3. STRICT BOUNDARY CHECK: Prevent spilling into the void!
+        if not site_poly.contains(Point(new_pos)):
+            continue # Skip this spawn, try somewhere else next tick
+            
+        # 4. ANGLE CHECK: Prevent sharp blocks
+        min_angle_rad = np.radians(request.min_intersect_angle)
+        if not _check_angle_validity(G, parent, new_pos, min_angle_rad):
+            continue
+            
         # Add the Node & Primary Bond
-        G.add_node(i, pos=new_pos, type=node_type, age=0)
+        G.add_node(i, pos=new_pos, type=node_type, frozen=False, quiet_ticks=0)
         is_major = (G.nodes[parent]['type'] == 'major' and node_type == 'major')
         G.add_edge(parent, i, weight=spawn_dist, is_arterial=is_major)
         
-        # Attempt Phase 2: Topological Weaving (Secondary Bonds)
         _attempt_cross_link(G, i, request)
         
-        # --- THE PHYSICS RELAXATION & HISTORICAL FREEZING ---
-        # Update ages
-        for n in G.nodes:
-            G.nodes[n]['age'] += 1
+        # --- THE PHYSICS RELAXATION & DISPLACEMENT-BASED FREEZING ---
+        # Run solver only every 5 spawns for performance
+        if i % 5 == 0:
+            old_positions = {n: G.nodes[n]['pos'].copy() for n in G.nodes}
+            frozen_nodes = [n for n in G.nodes if G.nodes[n]['frozen']]
             
-        # Identify Frozen Nodes (Ancient historical core)
-        frozen_nodes = [n for n in G.nodes if G.nodes[n]['age'] >= request.freezing_age_threshold]
-        
-        # If everyone is frozen (rare, but possible if growth is slow), unfreeze the newest to keep physics alive
-        if len(frozen_nodes) == len(G.nodes) and len(G.nodes) > 1:
-            frozen_nodes.remove(i)
+            # Safety: ensure at least the newest node is always active
+            active_nodes = [n for n in G.nodes if not G.nodes[n]['frozen']]
+            if not active_nodes:
+                G.nodes[i]['frozen'] = False
+                G.nodes[i]['quiet_ticks'] = 0
+                frozen_nodes = [n for n in G.nodes if G.nodes[n]['frozen']]
+
+            current_positions = nx.get_node_attributes(G, 'pos')
             
-        # Run Physics Simulation (Spring Layout)
-        # NetworkX's Fruchterman-Reingold acts as our force-directed annealer
-        current_positions = nx.get_node_attributes(G, 'pos')
-        
-        # Execute 3 iterations of physics per spawn tick
-        new_positions = nx.spring_layout(
-            G, 
-            pos=current_positions, 
-            fixed=frozen_nodes if frozen_nodes else None, 
-            k=spawn_dist, # Optimal distance between nodes
-            weight='weight',
-            iterations=3,
-            seed=42
-        )
-        
-        # Update graph with relaxed positions
-        nx.set_node_attributes(G, new_positions, 'pos')
+            new_positions = nx.spring_layout(
+                G, 
+                pos=current_positions, 
+                fixed=frozen_nodes if frozen_nodes else None, 
+                k=request.arterial_length * 1.2,
+                weight='weight',
+                iterations=10,
+                seed=42,
+                scale=None
+            )
+            nx.set_node_attributes(G, new_positions, 'pos')
+            
+            # Update quiet_ticks and freeze nodes that have settled
+            for n in G.nodes:
+                if G.nodes[n]['frozen']:
+                    continue
+                delta = np.linalg.norm(G.nodes[n]['pos'] - old_positions[n])
+                if delta < request.settle_threshold:
+                    G.nodes[n]['quiet_ticks'] += 1
+                    if G.nodes[n]['quiet_ticks'] >= 3:
+                        G.nodes[n]['frozen'] = True
+                else:
+                    G.nodes[n]['quiet_ticks'] = 0
 
     return G
 
@@ -151,7 +216,7 @@ def generate_base_graph(request: GenerationRequest) -> nx.Graph:
 def planarize_graph(G: nx.Graph) -> nx.Graph:
     """
     Phase 3: Mesh Healing (Planarization).
-    Breaks intersecting edges while inheriting the 'age' and 'is_arterial' states.
+    Breaks intersecting edges while inheriting the 'frozen' and 'is_arterial' states.
     """
     lines = []
     # Store a mapping of LineStrings back to their original edge data to preserve is_arterial
@@ -178,7 +243,7 @@ def planarize_graph(G: nx.Graph) -> nx.Graph:
     coord_to_id = {}
     next_id = 0
     
-    # Pre-map the original nodes so we can inherit their age/type
+    # Pre-map the original nodes so we can inherit their frozen/type state
     original_coords = { (round(data['pos'][0], 4), round(data['pos'][1], 4)): data for n, data in G.nodes(data=True) }
     
     def get_or_create_node(coord):
@@ -188,13 +253,14 @@ def planarize_graph(G: nx.Graph) -> nx.Graph:
         if coord_tup not in coord_to_id:
             coord_to_id[coord_tup] = next_id
             
-            # INHERITANCE: If this coordinate matches an original node, keep its age/type!
+            # INHERITANCE: If this coordinate matches an original node, keep its frozen state/type!
             if coord_tup in original_coords:
                 orig_data = original_coords[coord_tup]
-                G_planar.add_node(next_id, pos=np.array(coord), type=orig_data['type'], age=orig_data['age'])
+                G_planar.add_node(next_id, pos=np.array(coord), type=orig_data['type'],
+                                  frozen=orig_data.get('frozen', False), quiet_ticks=orig_data.get('quiet_ticks', 0))
             else:
-                # It's a newly sliced intersection node. It is young and minor.
-                G_planar.add_node(next_id, pos=np.array(coord), type='minor', age=0)
+                # It's a newly sliced intersection node. It is unfrozen and minor.
+                G_planar.add_node(next_id, pos=np.array(coord), type='minor', frozen=False, quiet_ticks=0)
             next_id += 1
             
         return coord_to_id[coord_tup]
@@ -286,8 +352,8 @@ def finalize_city(G: nx.Graph, parks: List[Polygon], request: GenerationRequest)
     # ---------------------------------------------------------
     # 1. Final Physics Annealing
     # ---------------------------------------------------------
-    # Identify which nodes were historically frozen
-    frozen_nodes = [n for n in G.nodes if G.nodes[n]['age'] >= request.freezing_age_threshold]
+    # Identify which nodes have already settled (displacement-frozen)
+    frozen_nodes = [n for n in G.nodes if G.nodes[n].get('frozen', False)]
     
     # Run a quick relaxation to smooth out the new Delaunay void-streets
     new_positions = nx.spring_layout(
@@ -297,9 +363,18 @@ def finalize_city(G: nx.Graph, parks: List[Polygon], request: GenerationRequest)
         k=request.local_length, 
         weight='weight',
         iterations=5, # Just enough to smooth the jagged edges
-        seed=42
+        seed=42,
+        scale=None
     )
     nx.set_node_attributes(G, new_positions, 'pos')
+
+    # ---------------------------------------------------------
+    # 1.5 Calculate Graph Enclosed Footprint
+    # ---------------------------------------------------------
+    # We want to differentiate between blocks inside the graph loops and the "leftover" space outside.
+    lines_for_footprint = [LineString([G.nodes[u]['pos'], G.nodes[v]['pos']]) for u, v in G.edges]
+    faces = list(polygonize(lines_for_footprint))
+    enclosed_footprint = unary_union(faces) if faces else Polygon()
 
     # ---------------------------------------------------------
     # 2. Street Buffering (Geometry Translation)
@@ -354,8 +429,15 @@ def finalize_city(G: nx.Graph, parks: List[Polygon], request: GenerationRequest)
         if block.area < 10.0: continue
             
         is_park = False
+        # 1. Check if it is explicitly a park from Phase 4
         if not park_union.is_empty and block.intersection(park_union).area > (block.area * 0.5):
             is_park = True
+            
+        # 2. Check if it is outside the graph's enclosed footprint (leftover space)
+        if not is_park:
+            # If the block is not significantly contained within the enclosed loops, it's green space
+            if enclosed_footprint.is_empty or block.intersection(enclosed_footprint).area < (block.area * 0.5):
+                is_park = True
             
         # FIX: Use native mapping to guarantee perfect GeoJSON translation
         geom_mapped = mapping(block)
